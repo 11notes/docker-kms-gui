@@ -25,7 +25,7 @@ services:
     restart: "always"
 
   gui:
-    image: "11notes/kms-gui:1.0.0"
+    image: "11notes/kms-gui:latest"
     depends_on:
       app:
         condition: "service_healthy"
@@ -91,4 +91,4 @@ This image supports unraid by default. Simply add **-unraid** to any tag and the
 # ElevenNotes™️
 This image is provided to you at your own risk. Always make backups before updating an image to a different version. Check the [releases](https://github.com/11notes/docker-kms-gui/releases) for breaking changes. If you have any problems with using this image simply raise an [issue](https://github.com/11notes/docker-kms-gui/issues), thanks. If you have a question or inputs please create a new [discussion](https://github.com/11notes/docker-kms-gui/discussions) instead of an issue. You can find all my other repositories on [github](https://github.com/11notes?tab=repositories).
 
-*created 11.06.2025, 09:35:36 (CET)*
+*created 09.07.2025, 21:45:41 (CET)*
