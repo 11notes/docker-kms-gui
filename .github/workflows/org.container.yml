@@ -1,0 +1,919 @@
+name: org.container
+run-name: ${{ inputs.run-name }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GRYPE_MATCH_GOLANG_USING_CPES: true
+  GRYPE_MATCH_DOTNET_USING_CPES: true
+  GRYPE_MATCH_JAVASCRIPT_USING_CPES: true
+  GRYPE_MATCH_PYTHON_USING_CPES: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      run-name:
+        description: 'set run-name for workflow (multiple calls)'
+        type: string
+        required: false
+        default: 'docker'
+
+      platform:
+        description: 'list of platforms to build for'
+        type: string
+        required: false
+        default: "amd64,arm64,arm/v7"
+
+      build:
+        description: 'set WORKFLOW_BUILD'
+        required: false
+        default: 'true'
+
+      release:
+        description: 'set WORKFLOW_GITHUB_RELEASE'
+        required: false
+        default: 'false'
+
+      readme:
+        description: 'set WORKFLOW_GITHUB_README'
+        required: false
+        default: 'false'
+
+      etc:
+        description: 'base64 encoded json string'
+        required: false
+
+jobs:
+  # ╔═════════════════════════════════════════════════════╗
+  # ║                                                     ║
+  # ║                                                     ║
+  # ║               CREATE PLATFORM MATRIX                ║
+  # ║                                                     ║
+  # ║                                                     ║
+  # ╚═════════════════════════════════════════════════════╝
+  matrix:
+    name: create job matrix
+    runs-on: ubuntu-latest
+    outputs:
+      stringify: ${{ steps.setup-matrix.outputs.stringify }}
+
+    steps:
+      # CHECKOUT REPOSITORY
+      - name: init / checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: matrix / setup list
+        id: setup-matrix
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const { existsSync, readFileSync } = require('node:fs');
+            const { inspect } = require('node:util');
+            const { resolve } = require('node:path');
+            const opt = {dot:{}};
+
+            try{
+              const path = resolve('.json');
+              if(existsSync(path)){
+                try{
+                  opt.dot = JSON.parse(readFileSync(path).toString());
+                }catch(e){
+                  throw new Error('could not parse .json');
+                }
+              }else{
+                throw new Error('.json does not exist');
+              }
+            }catch(e){
+              core.setFailed(e);
+            }
+
+            const platforms = (
+              ("${{ github.event.inputs.platform }}" != "amd64,arm64,arm/v7") ? "${{ github.event.inputs.platform }}".split(",") : (
+                (opt.dot?.platform) ? opt.dot.platform.split(",") : "${{ github.event.inputs.platform }}".split(",")
+              )
+            );
+
+            const matrix = {include:[]};
+            if("${{ github.event.inputs.readme }}" === "true" && "${{ github.event.inputs.build }}" === "false"){
+              matrix.include.push({platform:"amd64", runner:"ubuntu-24.04"});
+            }else{
+              for(const platform of platforms){
+                switch(platform){
+                  case "amd64": matrix.include.push({platform:platform, runner:"ubuntu-24.04"}); break;
+                  case "arm64": matrix.include.push({platform:platform, runner:"ubuntu-24.04-arm"}); break;
+                  case "arm/v7": matrix.include.push({platform:platform, runner:"ubuntu-24.04-arm"}); break;
+                }
+              }
+            }
+
+            const stringify = JSON.stringify(matrix);
+            core.setOutput('stringify', stringify);
+
+            // print
+              core.info(inspect({opt:opt, matrix:matrix, platforms:platforms}, {showHidden:false, depth:null, colors:true}));
+
+
+  # ╔═════════════════════════════════════════════════════╗
+  # ║                                                     ║
+  # ║                                                     ║
+  # ║                BUILD CONTAINER IMAGE                ║
+  # ║                                                     ║
+  # ║                                                     ║
+  # ╚═════════════════════════════════════════════════════╝
+  docker:
+    name: create container image
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.stringify) }}
+    outputs:
+      DOCKER_IMAGE_NAME: ${{ steps.setup-environment.outputs.DOCKER_IMAGE_NAME }}
+      DOCKER_IMAGE_MERGE_TAGS: ${{ steps.setup-environment.outputs.DOCKER_IMAGE_MERGE_TAGS }}
+      DOCKER_IMAGE_DESCRIPTION: ${{ steps.setup-environment.outputs.DOCKER_IMAGE_DESCRIPTION }}
+      DOCKER_IMAGE_NAME_AND_VERSION: ${{ steps.setup-environment.outputs.DOCKER_IMAGE_NAME_AND_VERSION }}
+      DOCKER_IMAGE_ARGUMENTS: ${{ steps.setup-environment.outputs.DOCKER_IMAGE_ARGUMENTS }}
+      DOCKER_CICD_LATEST: ${{ steps.setup-environment.outputs.DOCKER_CICD_LATEST }}
+      WORKFLOW_BUILD: ${{ steps.setup-environment.outputs.WORKFLOW_BUILD }}
+      REGISTRY_QUAY: ${{ steps.setup-environment.outputs.REGISTRY_QUAY }}
+
+    timeout-minutes: 1440
+
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+
+    permissions:
+      actions: write
+      contents: write
+      packages: write
+      attestations: write
+      id-token: write
+      security-events: write
+
+    needs: matrix
+
+    steps:
+      # ╔═════════════════════════════════════════════════════╗
+      # ║                 SETUP ENVIRONMENT                   ║
+      # ╚═════════════════════════════════════════════════════╝
+      # CHECKOUT ALL DEPTHS (ALL TAGS)
+      - name: init / checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      # CHECK IF QUAY.IO IS DOWN AGAIN
+      - name: init / check quay.io
+        run: |
+          echo "QUAY_STATUS=$(curl -s https://status.redhat.com/api/v2/components.json | jq -r '.components[] | select(.name | contains("Quay") or contains("quay")) | .status')" >> $GITHUB_ENV
+
+      # SETUP NODE JS
+      - name: update / setup node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '24'
+      - run: npm i semver
+
+      # SETUP ENVIRONMENT VARIABLES AND INPUTS
+      - name: init / setup environment
+        id: setup-environment
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const { existsSync, readFileSync, writeFileSync } = require('node:fs');
+            const { resolve } = require('node:path');
+            const { inspect } = require('node:util');
+            const { Buffer } = require('node:buffer');
+            const inputs = `${{ toJSON(github.event.inputs) }}`.
+              replace(/"platform":\s*"\[(.+)\]",/i, `"platform": [$1],`);
+            const opt = {input:{}, dot:{}};
+            const semverMajor = require("semver/functions/major");
+            const semverMinor = require("semver/functions/minor");
+            const semverValid = require("semver/functions/valid");
+            const semverCoerce = require("semver/functions/coerce");
+
+            try{
+              if(inputs.length > 0){
+                opt.input = JSON.parse(inputs);
+                if(opt.input?.etc){
+                  opt.input.etc = JSON.parse(Buffer.from(opt.input.etc, 'base64').toString('ascii'));
+                }
+              }
+            }catch(e){
+              core.warning('could not parse github.event.inputs');
+              core.warning(inputs);
+            }
+
+            try{
+              const path = resolve('.json');
+              if(existsSync(path)){
+                try{
+                  opt.dot = JSON.parse(readFileSync(path).toString());
+                }catch(e){
+                  throw new Error('could not parse .json');
+                }
+              }else{
+                throw new Error('.json does not exist');
+              }
+            }catch(e){
+              core.setFailed(e);
+            }
+
+            const docker = {
+              image:{
+                name:opt.dot.image,
+                arch:(opt.input?.etc?.arch || opt.dot?.arch || 'linux/amd64,linux/arm64'),
+                prefix:((opt.input?.etc?.semverprefix) ? `${opt.input?.etc?.semverprefix}-` : ''),
+                suffix:((opt.input?.etc?.semversuffix) ? `-${opt.input?.etc?.semversuffix}` : ''),
+                description:(opt.dot?.readme?.description || ''),
+                platform:{
+                  sanitized:"${{ matrix.platform }}".replace(/[^A-Z-a-z0-9]+/i, ""),
+                },
+                tags:[],
+                build:(opt.input?.build === undefined) ? false : opt.input.build,
+              },
+              app:{
+                image:opt.dot.image,
+                name:opt.dot.name,
+                version:(opt.input?.etc?.version || opt.dot?.semver?.version),
+                root:opt.dot.root,
+                UID:(opt.input?.etc?.uid || 1000),
+                GID:(opt.input?.etc?.gid || 1000),
+                no_cache:new Date().getTime(),
+              },
+              cache:{
+                registry:'localhost:5000/',
+                enable:(opt.input?.etc?.cache === undefined) ? true : opt.input.etc.cache,
+              },
+              registry:{
+                docker:{enabled:true},
+                ghcr:{enabled:true},
+                quay:{enabled:true},
+              },
+              grype:{
+                fail:(opt.input?.etc?.grype?.fail || opt.dot?.grype?.fail)
+              },
+              tags:[],
+              merge_tags:[],
+            };
+
+            if(docker.grype.fail === undefined){
+              docker.grype.fail = false;
+            }
+
+            try{
+              // wait 2.5s too not trigger 429 from github
+              await new Promise(r => setTimeout(r, 2500));
+              const response = await fetch('https://raw.githubusercontent.com/11notes/CICD/refs/heads/master/semver/latest.json');
+              if(!response.ok){
+                throw new Error(`error fetching global versions: ${response.status}`);
+              }
+              const result = await response.json();
+              for(const dep in result){
+                const depSemver = semverValid(semverCoerce(result[dep]));
+                docker.app[`${dep}_version`] = `${result[dep]}`;
+                docker.app[`${dep}_major_minor_version`] = `${semverMajor(depSemver)}.${semverMinor(depSemver)}`;
+                //docker.app[`${dep}_major_version`] = semverMajor(depSemver);
+                core.info(`setting APP_${String(dep).toUpperCase()}_VERSION to ${result[dep]}`);
+              }
+            }catch(e){
+              core.setFailed(e);
+            }
+
+            docker.cache.name = `${docker.image.name}:${docker.image.prefix}buildcache${docker.image.suffix}`;
+            docker.cache.grype = `${docker.cache.registry}${docker.image.name}:${docker.image.prefix}grype${docker.image.suffix}`;
+            docker.app.prefix = docker.image.prefix;
+            docker.app.suffix = docker.image.suffix;
+
+            const semver = (
+              (/stable|latest/i.test(docker.app.version)) ? [] : docker.app.version.split('.')
+            );
+
+            // setup additional version tags
+            if(semver.length >= 2){
+              docker.app.major_minor_version = `${semver[0]}.${semver[1]}`;
+            }
+
+            // setup tags
+              if(!opt.dot?.semver?.disable?.rolling && !opt.input.etc?.semver?.disable?.rolling){
+                docker.image.tags.push('rolling');
+              }
+              if(opt.input?.etc?.dockerfile !== 'arch.dockerfile' && opt.input?.etc?.tag){
+                docker.image.tags.push(opt.input.etc.tag);
+                if(Array.isArray(semver)){
+                  if(semver.length >= 1) docker.image.tags.push(`${opt.input.etc.tag}-${semver[0]}`);
+                  if(semver.length >= 2) docker.image.tags.push(`${opt.input.etc.tag}-${semver[0]}.${semver[1]}`);
+                  if(semver.length >= 3) docker.image.tags.push(`${opt.input.etc.tag}-${semver[0]}.${semver[1]}.${semver[2]}`);
+                }else{
+                  docker.image.tags.push(`${opt.input.etc.tag}-${docker.app.version}`);
+                }
+                docker.cache.name = `${docker.image.name}:buildcache-${opt.input.etc.tag}`;
+              }else if(docker.app.version !== 'latest'){
+                if(Array.isArray(semver)){
+                  if(semver.length >= 1) docker.image.tags.push(`${semver[0]}`);
+                  if(semver.length >= 2) docker.image.tags.push(`${semver[0]}.${semver[1]}`);
+                  if(semver.length >= 3) docker.image.tags.push(`${semver[0]}.${semver[1]}.${semver[2]}`);
+                }
+                if(opt.dot?.semver?.stable && new RegExp(opt.dot?.semver.stable, 'ig').test(docker.image.tags.join(',')) || docker.app.version === "stable") docker.image.tags.push('stable');
+                if(opt.dot?.semver?.latest && new RegExp(opt.dot?.semver.latest, 'ig').test(docker.image.tags.join(',')) || docker.app.version === "latest") docker.image.tags.push('latest');
+              }else{
+                docker.image.tags.push('latest');
+              }
+
+              for(const tag of docker.image.tags){
+                docker.tags.push(`${docker.image.name}:${docker.image.prefix}${tag}${docker.image.suffix}-${docker.image.platform.sanitized}`);
+                docker.tags.push(`ghcr.io/${docker.image.name}:${docker.image.prefix}${tag}${docker.image.suffix}-${docker.image.platform.sanitized}`);
+                if(/operational/i.test(process.env?.QUAY_STATUS)){
+                  core.setOutput('REGISTRY_QUAY', 'true');
+                  docker.tags.push(`quay.io/${docker.image.name}:${docker.image.prefix}${tag}${docker.image.suffix}-${docker.image.platform.sanitized}`);
+                }else{
+                  core.setOutput('REGISTRY_QUAY', 'false');
+                }
+                docker.merge_tags.push(`${docker.image.prefix}${tag}${docker.image.suffix}`);
+              }
+
+            // setup build arguments
+              if(opt.input?.etc?.build?.args){
+                for(const arg in opt.input.etc.build.args){
+                  docker.app[arg] = opt.input.etc.build.args[arg];
+                }
+              }
+              if(opt.dot?.build?.args){
+                for(const arg in opt.dot.build.args){
+                  docker.app[arg] = opt.dot.build.args[arg];
+                }
+              }
+
+              const arguments = [];
+              for(const argument in docker.app){
+                arguments.push(`APP_${argument.toUpperCase()}=${docker.app[argument]}`);
+              }
+
+            // export to environment
+              core.exportVariable('DOCKER_CACHE_REGISTRY', docker.cache.registry);
+              core.exportVariable('DOCKER_CACHE_NAME', `${docker.cache.name}-${docker.image.platform.sanitized}`);
+              core.exportVariable('DOCKER_CACHE_GRYPE', docker.cache.grype);
+
+              core.exportVariable('DOCKER_IMAGE_NAME', docker.image.name);
+              core.setOutput('DOCKER_IMAGE_NAME', docker.image.name);
+              core.exportVariable('DOCKER_IMAGE_TAGS', docker.tags.join(','));
+              core.exportVariable('DOCKER_IMAGE_MERGE_TAGS', docker.merge_tags.join("\r\n"));
+              core.setOutput('DOCKER_IMAGE_MERGE_TAGS', docker.merge_tags.join("\r\n"));
+              core.exportVariable('DOCKER_IMAGE_DESCRIPTION', docker.image.description);
+              core.setOutput('DOCKER_IMAGE_DESCRIPTION', docker.image.description);
+              core.exportVariable('DOCKER_IMAGE_ARGUMENTS', arguments.join("\r\n"));
+              core.setOutput('DOCKER_IMAGE_ARGUMENTS', arguments.join("\r\n"));
+              core.exportVariable('DOCKER_IMAGE_DOCKERFILE', opt.input?.etc?.dockerfile || 'arch.dockerfile');
+              core.exportVariable('DOCKER_IMAGE_PLATFORM_SANITIZED', docker.image.platform.sanitized);
+              core.exportVariable('DOCKER_IMAGE_NAME_AND_VERSION', `${docker.image.name}:${docker.app.version}`);
+              core.setOutput('DOCKER_IMAGE_NAME_AND_VERSION', `${docker.image.name}:${docker.app.version}`);
+              core.exportVariable('DOCKER_APP_VERSION', `${docker.app.version}`);
+
+              // CI/CD
+              core.setOutput('DOCKER_CICD_LATEST', opt.dot?.CICD?.latest || false);
+
+              core.setOutput('DOCKER_IMAGE_TAG_LATEST', (
+                docker.image.tags.includes('latest') ? "true" : "false"
+              ));
+
+              core.exportVariable('WORKFLOW_BUILD', docker.image.build);
+              core.setOutput('WORKFLOW_BUILD', docker.image.build);
+              core.exportVariable('WORKFLOW_BUILD_NO_CACHE', !docker.cache.enable);
+
+              core.exportVariable('WORKFLOW_CREATE_RELEASE', (opt.input?.release === undefined) ? false : opt.input.release);
+              core.exportVariable('WORKFLOW_CREATE_README', (opt.input?.readme === undefined) ? false : opt.input.readme);
+              core.exportVariable('WORKFLOW_GRYPE_FAIL_ON_SEVERITY', docker.grype.fail);
+              core.exportVariable('WORKFLOW_GRYPE_SEVERITY_CUTOFF', (opt.dot?.grype?.severity || 'critical'));
+
+            // check if workflow needs to be registered
+              const dockerfile = opt.input?.etc?.dockerfile || 'arch.dockerfile';
+              try{
+                const path = resolve(`./${dockerfile}`);
+                if(existsSync(path)){
+                  try{
+                    const file = readFileSync(path).toString();
+                    switch(true){
+                      case /11notes\/alpine\:stable/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', '11notes-alpine-stable'); break;
+                      case /11notes\/go\:\$\{APP_GO_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'go'); break;
+                      case /11notes\/python\:\$\{APP_PYTHON_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'python'); break;
+                      case /11notes\/php\:\$\{APP_PHP_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'php'); break;
+                      case /11notes\/php-fpm\:\$\{APP_PHP_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'php'); break;
+                      case /11notes\/dotnetsdk\:\$\{APP_DOTNET8_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'dotnet8'); break;
+                      case /11notes\/dotnetsdk\:\$\{APP_DOTNET9_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'dotnet9'); break;
+                      case /11notes\/dotnetsdk\:\$\{APP_DOTNET10_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'dotnet10'); break;
+                      case /11notes\/dotnetsdk\:\$\{APP_DOTNET11_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'dotnet11'); break;
+                      case /11notes\/node\:\$\{APP_NODE_VERSION\}/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'node'); break;
+                      case /11notes\/node\:stable/ig.test(file): core.exportVariable('WORKFLOW_IMAGE_DEPENDENCY', 'node_stable'); break;
+                    }
+                  }catch(e){
+                    throw new Error(`could not open ./${dockerfile}: ${e}`);
+                  }
+                }else{
+                  throw new Error(`./${dockerfile} does not exist`);
+                }
+              }catch(e){
+                core.warning(e);
+              }
+
+            // export all variables
+              const objectToEnvArray = (o, p = '', a = []) => {
+                for(const k in o){
+                  switch(typeof(o[k])){
+                    case 'object':
+                    case 'array':
+                      objectToEnvArray(o[k], `${p}${k}_`.toUpperCase(), a)
+                      break;
+                    default:
+                      a.push(`${p}${k}`.toUpperCase() + '=' + o[k]);
+                  }
+                }
+                return(a);
+              }
+
+              writeFileSync('${{ runner.temp }}/global.env', objectToEnvArray(opt.dot, 'GLOBAL_JSON_').join('\n') + '\n', {encoding: "utf8", flag: "a+"});
+              writeFileSync('${{ runner.temp }}/global.env', objectToEnvArray(docker, 'GLOBAL_DOCKER_').join('\n') + '\n', {encoding: "utf8", flag: "a+"});
+              writeFileSync('${{ runner.temp }}/global.env', objectToEnvArray(opt.input?.etc, 'GLOBAL_INPUT_ETC_').join('\n') + '\n', {encoding: "utf8", flag: "a+"});
+
+            // print
+              core.info(inspect({opt:opt, docker:docker}, {showHidden:false, depth:null, colors:true}));
+
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║             DEPENDENCY REGISTRATION                 ║
+      # ╚═════════════════════════════════════════════════════╝
+      # REGISTER WORKFLOW DEPENDENCY ON BASE IMAGE
+      - name: register image dependency
+        uses: benc-uk/workflow-dispatch@31e2b3319479a63f0ab15bf800eff9e913504e26 #v1.3.2
+        if: env.WORKFLOW_IMAGE_DEPENDENCY != '' && matrix.platform == 'amd64'
+        with:
+          wait-for-completion: false
+          workflow: register.dependency.yml
+          token: "${{ secrets.REPOSITORY_TOKEN }}"
+          repo: 11notes/static
+          ref: master
+          inputs: '{ "dependency":"${{ env.WORKFLOW_IMAGE_DEPENDENCY }}", "repository":"${{ github.event.repository.name }}" }'
+
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║             CONTAINER REGISTRY LOGIN                ║
+      # ╚═════════════════════════════════════════════════════╝
+      # DOCKER HUB
+      - name: docker / login to hub
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          username: 11notes
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      # GITHUB CONTAINER REGISTRY
+      - name: github / login to ghcr
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: 11notes
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # REDHAT QUAY
+      - name: quay / login to quay
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: quay.io
+          username: 11notes+github
+          password: ${{ secrets.QUAY_TOKEN }}
+
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║               BUILD CONTAINER IMAGE                 ║
+      # ╚═════════════════════════════════════════════════════╝
+      # SETUP QEMU
+      - name: container image / setup qemu
+        if: env.WORKFLOW_BUILD == 'true' && matrix.platform == 'arm/v7'
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+        with:
+          image: tonistiigi/binfmt:qemu-v8.1.5
+          cache-image: false
+
+      # SETUP BUILDX BUILDER WITH USING LOCAL REGISTRY
+      - name: container image / setup buildx
+        if: env.WORKFLOW_BUILD == 'true'
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          driver-opts: network=host
+
+      # BUILD CONTAINER IMAGE FROM GLOBAL CACHE (DOCKER HUB) AND PUSH TO LOCAL CACHE
+      - name: container image / build
+        if: env.WORKFLOW_BUILD == 'true'
+        id: image-build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          no-cache: ${{ env.WORKFLOW_BUILD_NO_CACHE }}
+          file: ${{ env.DOCKER_IMAGE_DOCKERFILE }}
+          push: true
+          platforms: linux/${{ matrix.platform }}
+          cache-from: type=registry,ref=${{ env.DOCKER_CACHE_NAME }}
+          cache-to: type=registry,ref=${{ env.DOCKER_CACHE_REGISTRY }}${{ env.DOCKER_CACHE_NAME }},mode=max,compression=zstd,force-compression=true
+          build-args: |
+            ${{ env.DOCKER_IMAGE_ARGUMENTS }}
+          tags: |
+            ${{ env.DOCKER_CACHE_GRYPE }}
+
+      # SCAN LOCAL CONTAINER IMAGE WITH GRYPE
+      - name: container image / scan with grype
+        if: env.WORKFLOW_BUILD == 'true' && matrix.platform == 'amd64'
+        id: grype
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        with:
+          image: ${{ env.DOCKER_CACHE_GRYPE }}
+          fail-build: ${{ env.WORKFLOW_GRYPE_FAIL_ON_SEVERITY }}
+          severity-cutoff: ${{ env.WORKFLOW_GRYPE_SEVERITY_CUTOFF }}
+          output-format: 'sarif'
+          output-file: ${{ runner.temp }}/grype.json
+
+      - name: container image / scan with grype FAILED / json output
+        if: env.WORKFLOW_BUILD == 'true' && (failure() || steps.grype.outcome == 'failure') && steps.image-build.outcome == 'success'
+        run: |
+          cat ${{ runner.temp }}/grype.json | jq -r '.runs[].tool.driver.rules[].help.markdown' >> $GITHUB_STEP_SUMMARY
+
+      # PERFORM INTEGRATION TEST
+      - name: container image / integration test
+        id: integration
+        if: hashFiles('./.github/tests/integration/compose.yml') != ''
+        run: |
+          cd ./.github/tests/integration
+          IMAGE="${{ env.DOCKER_CACHE_GRYPE }}" docker compose up -d
+          echo "waiting for container startup (max 60s) ..."
+          for TRY in $(seq 1 12); do
+            HEALTH=$(docker inspect --format='{{json .State.Health}}' integration-main-1 | jq -r '.Status')
+            echo "container health (#${TRY}): ${HEALTH}"
+            if [ ${HEALTH} == "healthy" ]; then
+              echo "integration test successfull!"
+              exit 0
+            else
+              if [ ${HEALTH} == "unhealthy" ]; then
+                break
+              else
+                sleep 5s
+              fi
+            fi
+          done
+          echo "container integration test failed!!!"
+          echo "container healthcheck logs:"
+          echo "-----------------------------------------------------------------"
+          docker inspect --format='{{json .State.Health}}' integration-main-1 | jq
+          echo "container logs:"
+          echo "-----------------------------------------------------------------"
+          docker logs integration-main-1
+          exit 1
+
+      # PUSH IMAGE TO ALL REGISTRIES IF CLEAN
+      - name: container image / push to registries
+        id: image-push
+        if: env.WORKFLOW_BUILD == 'true'
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          no-cache: ${{ env.WORKFLOW_BUILD_NO_CACHE }}
+          file: ${{ env.DOCKER_IMAGE_DOCKERFILE }}
+          push: true
+          sbom: true
+          provenance: mode=max
+          platforms: linux/${{ matrix.platform }}
+          cache-from: type=registry,ref=${{ env.DOCKER_CACHE_REGISTRY }}${{ env.DOCKER_CACHE_NAME }}
+          cache-to: type=registry,ref=${{ env.DOCKER_CACHE_NAME }},mode=max,compression=zstd,force-compression=true
+          build-args: |
+            ${{ env.DOCKER_IMAGE_ARGUMENTS }}
+          tags: |
+            ${{ env.DOCKER_IMAGE_TAGS }}
+
+      # CREATE ATTESTATION ARTIFACTS
+      - name: container image / create attestation artifacts
+        if: env.WORKFLOW_BUILD == 'true' && steps.image-push.outcome == 'success'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: docker.io/${{ env.DOCKER_IMAGE_NAME }}
+          subject-digest: ${{ steps.image-push.outputs.digest }}
+          push-to-registry: false
+
+      # EXPORT DIGEST
+      - name: container image / export digest
+        if: env.WORKFLOW_BUILD == 'true' && steps.image-push.outcome == 'success'
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.image-push.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      # UPLOAD DIGEST
+      - name: container image / upload
+        if: env.WORKFLOW_BUILD == 'true' && steps.image-push.outcome == 'success'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: digests-linux-${{ env.DOCKER_IMAGE_PLATFORM_SANITIZED }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+
+      # SET BUILD AS SUCCESSFULL
+      - name: container image / success
+        if: env.WORKFLOW_BUILD == 'true' && steps.image-push.outcome == 'success'
+        id: build-success
+        run: |
+          echo "GLOBAL_WORKFLOW_BUILD_SUCCESS=true" >> ${{ runner.temp }}/global.env
+
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║               CREATE GITHUB RELEASE                 ║
+      # ╚═════════════════════════════════════════════════════╝
+      # CREATE RELEASE MARKUP
+      - name: github release / prepare markdown
+        if: env.WORKFLOW_CREATE_RELEASE == 'true' && matrix.platform == 'amd64'
+        id: git-release
+        uses: 11notes/action-docker-release@v1
+
+      # CREATE GITHUB RELEASE
+      - name: github release / create
+        if: env.WORKFLOW_CREATE_RELEASE == 'true' && steps.git-release.outcome == 'success'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          token: ${{ secrets.REPOSITORY_TOKEN }}
+          tag_name: ${{ github.ref }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.git-release.outputs.release }}
+          draft: false
+          prerelease: false
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║            UPLOAD GLOBAL.ENV ARTIFACT               ║
+      # ╚═════════════════════════════════════════════════════╝
+      - name: github workflow / export environment
+        if: matrix.platform == 'amd64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: global.env
+          path: ${{ runner.temp }}/global.env
+
+
+  # ╔═════════════════════════════════════════════════════╗
+  # ║                                                     ║
+  # ║                                                     ║
+  # ║         MERGE IMAGES INTO SINGLE MANIFEST           ║
+  # ║                                                     ║
+  # ║                                                     ║
+  # ╚═════════════════════════════════════════════════════╝
+  merge_platform_images:
+    needs: docker
+    if: needs.docker.outputs.WORKFLOW_BUILD == 'true'
+    name: merge platform images to a single manifest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        registry: ${{ needs.docker.outputs.REGISTRY_QUAY == 'true' && fromJSON('["docker.io", "ghcr.io", "quay.io"]') || fromJSON('["docker.io", "ghcr.io"]') }}
+
+    env:
+      DOCKER_IMAGE_NAME: ${{ needs.docker.outputs.DOCKER_IMAGE_NAME }}
+      DOCKER_IMAGE_MERGE_TAGS: ${{ needs.docker.outputs.DOCKER_IMAGE_MERGE_TAGS }}
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      # ╔═════════════════════════════════════════════════════╗
+      # ║               LOAD GLOBAL VARIABLES                 ║
+      # ╚═════════════════════════════════════════════════════╝
+      # LOAD ARTIFACT
+      - name: global variables / load artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: global.env
+          path: ${{ runner.temp }}
+
+      # SET ENV
+      - name: global variables / set env
+        run: cat ${{ runner.temp }}/global.env >> $GITHUB_ENV
+
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║             CONTAINER REGISTRY LOGIN                ║
+      # ╚═════════════════════════════════════════════════════╝
+      # DOCKER HUB
+      - name: docker / login to hub
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          username: 11notes
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      # GITHUB CONTAINER REGISTRY
+      - name: github / login to ghcr
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: 11notes
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # REDHAT QUAY
+      - name: quay / login to quay
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: quay.io
+          username: 11notes+github
+          password: ${{ secrets.QUAY_TOKEN }}
+
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║           MERGE PLATFORM IMAGES MANIFEST            ║
+      # ╚═════════════════════════════════════════════════════╝
+      # DOWNLOAD DIGESTS
+      - name: platform merge / digest
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      # SETUP BUILDX BUILDER
+      - name: platform merge / buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      # GET META DATA
+      - name: platform merge / meta
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ matrix.registry }}/${{ env.DOCKER_IMAGE_NAME }}
+          tags: |
+            ${{ env.DOCKER_IMAGE_MERGE_TAGS }}
+
+      # CREATE MANIFEST
+      - name: platform merge / create manifest and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'docker.io/${{ env.DOCKER_IMAGE_NAME }}@sha256:%s ' *)
+
+      # INSPECT MANIFEST
+      - name: platform merge / inspect
+        run: |
+          docker buildx imagetools inspect ${{ matrix.registry }}/${{ env.DOCKER_IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+ 
+
+  # ╔═════════════════════════════════════════════════════╗
+  # ║                                                     ║
+  # ║                                                     ║
+  # ║               FINALIZE IMAGE CREATION               ║
+  # ║                                                     ║
+  # ║                                                     ║
+  # ╚═════════════════════════════════════════════════════╝
+  finally:
+    if: ${{ always() }}
+    needs:
+      - docker
+      - merge_platform_images
+    name: finalize image creation
+    runs-on: ubuntu-latest
+
+    env:
+      DOCKER_IMAGE_NAME: ${{ needs.docker.outputs.DOCKER_IMAGE_NAME }}
+      DOCKER_IMAGE_DESCRIPTION: ${{ needs.docker.outputs.DOCKER_IMAGE_DESCRIPTION }}
+      DOCKER_IMAGE_NAME_AND_VERSION: ${{ needs.docker.outputs.DOCKER_IMAGE_NAME_AND_VERSION }}
+      DOCKER_IMAGE_ARGUMENTS: ${{ needs.docker.outputs.DOCKER_IMAGE_ARGUMENTS }}
+      DOCKER_IMAGE_TAG_LATEST: ${{ needs.docker.outputs.DOCKER_IMAGE_TAG_LATEST }}
+
+    permissions:
+      contents: write
+
+    steps:
+      # ╔═════════════════════════════════════════════════════╗
+      # ║               LOAD GLOBAL VARIABLES                 ║
+      # ╚═════════════════════════════════════════════════════╝
+      # LOAD ARTIFACT
+      - name: global variables / load artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: global.env
+          path: ${{ runner.temp }}
+
+      # SET ENV
+      - name: global variables / set env
+        run: cat ${{ runner.temp }}/global.env >> $GITHUB_ENV
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║                 SETUP ENVIRONMENT                   ║
+      # ╚═════════════════════════════════════════════════════╝
+      # CHECKOUT ALL DEPTHS (ALL TAGS)
+      - name: init / checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: master
+          fetch-depth: 0
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║             CONTAINER REGISTRY LOGIN                ║
+      # ╚═════════════════════════════════════════════════════╝
+      # DOCKER HUB
+      - name: docker / login to hub
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          username: 11notes
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║                  CREATE README.md                   ║
+      # ╚═════════════════════════════════════════════════════╝
+      # CHECKOUT HEAD TO BE UP TO DATE WITH EVERYTHING
+      - name: README.md / checkout
+        if: github.event.inputs.readme == 'true'
+        continue-on-error: true
+        run: |
+          git checkout HEAD
+
+      # CREATE MAKRDOWN OF README.md
+      - name: README.md / create
+        if: github.event.inputs.readme == 'true' && (env.GLOBAL_WORKFLOW_BUILD_SUCCESS == 'true' || github.event.inputs.run-name == 'readme')
+        id: github-readme
+        continue-on-error: true
+        uses: 11notes/action-docker-readme@v1
+
+      # UPLOAD README.md to DOCKER HUB
+      - name: README.md / push to Docker Hub
+        if: github.event.inputs.readme == 'true' && steps.github-readme.outcome == 'success' && hashFiles('README_NONGITHUB.md') != ''
+        continue-on-error: true
+        uses: christian-korneck/update-container-description-action@d36005551adeaba9698d8d67a296bd16fa91f8e8 # v1
+        env:
+          DOCKER_USER: 11notes
+          DOCKER_PASS: ${{ secrets.DOCKER_TOKEN }}
+        with:
+          destination_container_repo: ${{ env.DOCKER_IMAGE_NAME }}
+          provider: dockerhub
+          short_description: ${{ env.DOCKER_IMAGE_DESCRIPTION }}
+          readme_file: 'README_NONGITHUB.md'
+
+      # COMMIT NEW README.md, LICENSE and compose
+      - name: README.md / github commit & push
+        if: github.event.inputs.readme == 'true' && steps.github-readme.outcome == 'success' && hashFiles('README.md') != ''
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if [ -f compose.yaml ]; then
+            git add compose.yaml
+          fi
+          if [ -f compose.yml ]; then
+            git add compose.yml
+          fi
+          if [ -f LICENSE ]; then
+            git add LICENSE
+          fi
+          git commit -m "update README.md"
+          git push origin HEAD:master
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║         GITHUB REPOSITORY DEFAULT SETTINGS          ║
+      # ╚═════════════════════════════════════════════════════╝
+      # UPDATE REPO WITH DEFAULT SETTINGS FOR CONTAINER IMAGE
+      - name: github / update description and set repo defaults
+        run: |
+          curl --request PATCH \
+            --url https://api.github.com/repos/${{ github.repository }} \
+            --header 'authorization: Bearer ${{ secrets.REPOSITORY_TOKEN }}' \
+            --header 'content-type: application/json' \
+            --data '{
+              "description":"${{ env.DOCKER_IMAGE_DESCRIPTION }}",
+              "homepage":"",
+              "has_issues":true,
+              "has_discussions":true,
+              "has_projects":false,
+              "has_wiki":false
+            }' \
+            --fail
+
+          curl --request PUT \
+            --url https://api.github.com/repos/${{ github.repository }}/actions/permissions/artifact-and-log-retention \
+            --header 'authorization: Bearer ${{ secrets.REPOSITORY_TOKEN }}' \
+            --header 'content-type: application/json' \
+            --data '{"days": 1}' \
+            --fail
+
+      # ╔═════════════════════════════════════════════════════╗
+      # ║        REMOVE DEFAULT IMAGE TAG IF PRESENT          ║
+      # ╚═════════════════════════════════════════════════════╝
+      # REMOVE LATEST TAG FROM DOCKER HUB
+      - name: docker hub / delete latest tag if needed
+        if: env.DOCKER_IMAGE_TAG_LATEST == 'false'
+        run: |
+          TOKEN=$(curl --request POST \
+            -s \
+            --url https://hub.docker.com/v2/auth/token \
+            --header 'content-type: application/json' \
+            --data '{
+              "identifier":"11notes",
+              "secret":"${{ secrets.DOCKER_TOKEN }}"
+            }' \
+            --fail | jq -r ".access_token")
+          curl -s -H "Authorization: Bearer ${TOKEN}" -X DELETE https://hub.docker.com/v2/repositories/${{ env.DOCKER_IMAGE_NAME }}/tags/latest || echo ":latest tag not found"

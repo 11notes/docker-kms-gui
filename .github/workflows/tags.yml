@@ -4,62 +4,27 @@ on:
     tags:
       - 'v*'
 jobs:
-  docker:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: init / base64 nested json
-        uses: actions/github-script@62c3794a3eb6788d9a2a72b219504732c0c9a298
+      - name: checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          script: |
-            const { Buffer } = require('node:buffer');
-            (async()=>{
-              try{
-                const master = await fetch('https://raw.githubusercontent.com/11notes/docker-kms/refs/heads/master/.json');
-                const dot = await master.json();
-                const etc = {
-                  version:dot.semver.version,
-                };
-                core.exportVariable('WORKFLOW_BASE64JSON', Buffer.from(JSON.stringify(etc)).toString('base64'));
-              }catch(e){
-                core.setFailed(`workflow failed: ${e}`);
-              }
-            })();
+          ref: ${{ github.ref_name }}
 
-      - name: build docker image
-        uses: the-actions-org/workflow-dispatch@3133c5d135c7dbe4be4f9793872b6ef331b53bc7
-        with:
-          workflow: docker.yml
-          token: "${{ secrets.REPOSITORY_TOKEN }}"
-          inputs: '{ "release":"true", "readme":"true", "etc":"${{ env.WORKFLOW_BASE64JSON }}" }'
+      - name: get latest version for 11notes/kms
+        run: |
+          echo "LATEST_VERSION=$(curl -s https://raw.githubusercontent.com/11notes/docker-kms/refs/heads/master/.json | jq -r '.semver.version')" >> "${GITHUB_ENV}"
 
-  docker-unraid:
-    runs-on: ubuntu-latest
-    steps:  
-      - name: init / base64 nested json
-        uses: actions/github-script@62c3794a3eb6788d9a2a72b219504732c0c9a298
+      - name: build etc for tag push
+        uses: 11notes/actions/tag@v1 # v1
         with:
-          script: |
-            const { Buffer } = require('node:buffer');
-            (async()=>{
-              try{
-                const master = await fetch('https://raw.githubusercontent.com/11notes/docker-kms/refs/heads/master/.json');
-                const dot = await master.json();
-                const etc = {
-                  version:dot.semver.version,
-                  semversuffix:"unraid",
-                  uid:99,
-                  gid:100,
-                };
-                core.exportVariable('WORKFLOW_BASE64JSON', Buffer.from(JSON.stringify(etc)).toString('base64'));
-              }catch(e){
-                core.setFailed(`workflow failed: ${e}`);
-              }
-            })();
-            
-      - name: build docker image for unraid community
-        uses: the-actions-org/workflow-dispatch@3133c5d135c7dbe4be4f9793872b6ef331b53bc7
+          etc: '{"version":"${{ env.LATEST_VERSION }}"}'
+
+      - name: build container images
+        uses: benc-uk/workflow-dispatch@7a027648b88c2413826b6ddd6c76114894dc5ec4 # v1.3.1
         with:
+          workflow: org.build.yml
           wait-for-completion: false
-          workflow: docker.yml
           token: "${{ secrets.REPOSITORY_TOKEN }}"
-          inputs: '{ "release":"false", "readme":"false", "run-name":"unraid", "etc":"${{ env.WORKFLOW_BASE64JSON }}" }'
+          inputs: '{ "ref":"${{ github.ref_name }}", "etc":"${{ env.ACTIONS_TAG_BASE64JSON }}" }'
