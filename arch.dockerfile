@@ -5,6 +5,8 @@ ARG APP_UID=1000
 ARG APP_GID=1000
 ARG BUILD_ROOT=/git/fork-pykms-frontend
 
+FROM 11notes/distroless:localhealth AS distroless-localhealth
+
 # :: Build / styles
   FROM alpine/git AS styles
   ARG APP_NO_CACHE
@@ -56,21 +58,14 @@ ARG BUILD_ROOT=/git/fork-pykms-frontend
 
   # :: install application
     RUN set -ex; \
-      apk --no-cache --update --virtual .build add \
-        py3-pip;
-
-    RUN set -ex; \
       mkdir -p ${APP_ROOT}/var; \
       cd /opt/py-kms; \
       echo "${APP_VERSION}" > VERSION; \
       echo "master" >> VERSION; \
-      pip3 install -r /opt/py-kms/requirements.gui.txt; \
-      pip3 list -o | sed 's/pip.*//' | grep . | cut -f1 -d' ' | tr " " "\n" | awk '{if(NR>=3)print}' | cut -d' ' -f1 | xargs -n1 pip3 install -U; \
-      apk del --no-network .build; \
-      rm -rf /usr/lib/python3.12/site-packages/pip;
+      uv install -r /opt/py-kms/requirements.gui.txt;
 
   # :: copy filesystem changes
-    COPY ./rootfs /      
+    COPY ./rootfs /
 
   # :: add multi template option
     RUN set -ex; \
@@ -79,10 +74,12 @@ ARG BUILD_ROOT=/git/fork-pykms-frontend
       cp -R /opt/py-kms/templates ${APP_ROOT}/styles/py-kms; \
       cp -R /opt/py-kms/static ${APP_ROOT}/styles/py-kms; \
       rm -rf /opt/py-kms/templates; \
-      rm -rf /opt/py-kms/static;
-    
+      rm -rf /opt/py-kms/static; \
+      rm -f /usr/local/bin/nc;
+
     COPY --from=styles ${BUILD_ROOT}/templates ${APP_ROOT}/styles/custom-icon/templates
     COPY --from=styles ${BUILD_ROOT}/static ${APP_ROOT}/styles/custom-icon/static
+    COPY --from=distroless-localhealth / /
 
   # :: set correct permissions
     RUN set -ex; \
@@ -92,7 +89,8 @@ ARG BUILD_ROOT=/git/fork-pykms-frontend
         /opt/py-kms;
 
 # :: Monitor
-  HEALTHCHECK --interval=5s --timeout=2s CMD curl -X GET -kILs --fail http://localhost:${PORT}/livez || exit 1
+  HEALTHCHECK --interval=5s --timeout=2s --start-period=5s \
+    CMD ["/usr/local/bin/localhealth", "http://localhost:3000/livez"]
 
 # :: Start
   USER ${APP_UID}:${APP_GID}
